@@ -1,8 +1,11 @@
 import feedparser
 import pandas as pd
 import matplotlib.pyplot as plt
+import logging
+import sqlite3
 from datetime import datetime
 from collections import Counter
+from pathlib import Path
 import re
 
 # RSS-ленты
@@ -15,8 +18,13 @@ RSS_FEEDS = {
 
 HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
 
-OUTPUT_CSV  = "kazan_news.csv"
-OUTPUT_PLOT = "kazan_news_plots.png"
+PROJECT_DIR = Path(__file__).resolve().parent
+DB_PATH = PROJECT_DIR / "news.db"
+OUTPUT_CSV = PROJECT_DIR / "kazan_news.csv"
+OUTPUT_PLOT = PROJECT_DIR / "kazan_news_plots.png"
+LOG_DIR = PROJECT_DIR / "logs"
+
+logger = logging.getLogger(__name__)
 
 # Стоп-слова для топ-слов
 STOPWORDS = set("""
@@ -54,15 +62,15 @@ def fetch_all_feeds():
         try:
             feed = feedparser.parse(url, request_headers=HEADERS)
         except Exception as e:
-            print(f"[{source}] Ошибка: {e}")
+            logger.exception("[%s] Ошибка загрузки RSS: %s", source, e)
             continue
 
         n = len(feed.entries)
         if n == 0:
-            print(f"[{source}] 0 записей — лента недоступна или пуста")
+            logger.warning("[%s] 0 записей — лента недоступна или пуста", source)
             continue
 
-        print(f"[{source}] получено: {n} записей")
+        logger.info("[%s] получено записей: %s", source, n)
 
         for entry in feed.entries:
             rows.append({
@@ -73,6 +81,170 @@ def fetch_all_feeds():
                 "date":    parse_date(entry),
             })
     return rows
+
+
+def timestamp_now():
+    """Возвращает локальную дату и время с указанием часового пояса."""
+    return datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def configure_logging():
+    LOG_DIR.mkdir(exist_ok=True)
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s",
+        handlers=[
+            logging.FileHandler(LOG_DIR / "kazan_news.log", encoding="utf-8"),
+            logging.StreamHandler(),
+        ],
+        force=True,
+    )
+
+
+def initialize_database(conn, migration_time):
+    """Создаёт таблицы и дополняет схему существующей базы."""
+    conn.execute("PRAGMA foreign_keys = ON")
+    conn.execute("PRAGMA busy_timeout = 30000")
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS articles (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source TEXT NOT NULL,
+            title TEXT NOT NULL,
+            link TEXT UNIQUE,
+            published_date TIMESTAMP,
+            category TEXT
+        )
+    """)
+
+    article_columns = {
+        row[1] for row in conn.execute("PRAGMA table_info(articles)").fetchall()
+    }
+    if "first_seen_at" not in article_columns:
+        conn.execute("ALTER TABLE articles ADD COLUMN first_seen_at TEXT")
+    if "last_seen_at" not in article_columns:
+        conn.execute("ALTER TABLE articles ADD COLUMN last_seen_at TEXT")
+
+    # Для старых строк время обнаружения неизвестно; фиксируем момент миграции.
+    conn.execute(
+        "UPDATE articles SET first_seen_at = ? WHERE first_seen_at IS NULL",
+        (migration_time,),
+    )
+    conn.execute(
+        "UPDATE articles SET last_seen_at = ? WHERE last_seen_at IS NULL",
+        (migration_time,),
+    )
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS ingestion_runs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            started_at TEXT NOT NULL,
+            finished_at TEXT,
+            status TEXT NOT NULL,
+            articles_seen INTEGER NOT NULL DEFAULT 0,
+            new_articles INTEGER NOT NULL DEFAULT 0,
+            existing_articles INTEGER NOT NULL DEFAULT 0,
+            error_message TEXT
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS article_observations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id INTEGER NOT NULL REFERENCES ingestion_runs(id),
+            article_id INTEGER NOT NULL REFERENCES articles(id),
+            observed_at TEXT NOT NULL,
+            UNIQUE (run_id, article_id)
+        )
+    """)
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_observations_run_id "
+        "ON article_observations(run_id)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_observations_article_id "
+        "ON article_observations(article_id)"
+    )
+    conn.commit()
+
+
+def create_ingestion_run(conn, started_at):
+    cursor = conn.execute(
+        "INSERT INTO ingestion_runs (started_at, status) VALUES (?, ?)",
+        (started_at, "running"),
+    )
+    conn.commit()
+    return cursor.lastrowid
+
+
+def save_observations(conn, run_id, rows, observed_at):
+    """Сохраняет новые статьи, обновляет last_seen и связывает их с запуском."""
+    new_articles = 0
+    existing_articles = 0
+    articles_seen = 0
+
+    with conn:
+        for row in rows:
+            link = str(row.get("link") or "").strip()
+            if not link:
+                logger.warning("Пропущена запись без ссылки: %s", row.get("title", ""))
+                continue
+
+            published_date = row.get("date")
+            if pd.notna(published_date):
+                published_date = pd.Timestamp(published_date).isoformat()
+            else:
+                published_date = None
+
+            cursor = conn.execute("""
+                INSERT OR IGNORE INTO articles (
+                    source, title, link, published_date, category,
+                    first_seen_at, last_seen_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (
+                row.get("source", ""),
+                row.get("title", ""),
+                link,
+                published_date,
+                "Без категории",
+                observed_at,
+                observed_at,
+            ))
+
+            if cursor.rowcount == 1:
+                article_id = cursor.lastrowid
+                new_articles += 1
+            else:
+                conn.execute(
+                    "UPDATE articles SET last_seen_at = ? WHERE link = ?",
+                    (observed_at, link),
+                )
+                article_id = conn.execute(
+                    "SELECT id FROM articles WHERE link = ?", (link,)
+                ).fetchone()[0]
+                existing_articles += 1
+
+            conn.execute("""
+                INSERT OR IGNORE INTO article_observations (
+                    run_id, article_id, observed_at
+                ) VALUES (?, ?, ?)
+            """, (run_id, article_id, observed_at))
+            articles_seen += 1
+
+    return articles_seen, new_articles, existing_articles
+
+
+def finish_ingestion_run(
+    conn, run_id, status, articles_seen=0, new_articles=0,
+    existing_articles=0, error_message=None,
+):
+    with conn:
+        conn.execute("""
+            UPDATE ingestion_runs
+            SET finished_at = ?, status = ?, articles_seen = ?,
+                new_articles = ?, existing_articles = ?, error_message = ?
+            WHERE id = ?
+        """, (
+            timestamp_now(), status, articles_seen, new_articles,
+            existing_articles, error_message, run_id,
+        ))
 
 
 def top_words(titles, n=10):
@@ -127,75 +299,85 @@ def build_plots(df):
     plt.tight_layout()
     plt.savefig(OUTPUT_PLOT, dpi=120)
     plt.close()
-    print(f"\nГрафики сохранены: {OUTPUT_PLOT}")
+    logger.info("Графики сохранены: %s", OUTPUT_PLOT)
 
 
 def print_summary(df):
     """Печатает сводку в консоль."""
-    print("\nСВОДКА")
-    print(f"Всего новостей: {len(df)}")
-    print(f"\nПо источникам:")
-    print(df["source"].value_counts().to_string())
+    logger.info("Сводка: всего новостей в текущей выборке: %s", len(df))
+    logger.info("По источникам:\n%s", df["source"].value_counts().to_string())
 
     valid_dates = df["date"].dropna()
     if len(valid_dates) > 0:
-        print(f"\nДиапазон дат: {valid_dates.min()} → {valid_dates.max()}")
+        logger.info("Диапазон дат: %s — %s", valid_dates.min(), valid_dates.max())
 
-    print(f"\nТоп-10 слов в заголовках:")
+    logger.info("Топ-10 слов в заголовках:")
     for w, c in top_words(df["title"].tolist(), n=10):
-        print(f"  {w}: {c}")
+        logger.info("  %s: %s", w, c)
 
 
 def main():
-    print("Сбор новостей\n")
-    rows = fetch_all_feeds()
+    configure_logging()
+    logger.info("Запуск сбора новостей")
+    started_at = timestamp_now()
+    conn = sqlite3.connect(DB_PATH, timeout=30)
+    run_id = None
+    articles_seen = 0
+    new_articles = 0
+    existing_articles = 0
 
-    if not rows:
-        print("\nНе удалось получить новости.")
-        return
+    try:
+        initialize_database(conn, started_at)
+        run_id = create_ingestion_run(conn, started_at)
+        rows = fetch_all_feeds()
 
-    df = pd.DataFrame(rows)
-    df["date"] = pd.to_datetime(df["date"], errors="coerce")
-    df = df.drop_duplicates(subset="link")
-    df = df.sort_values("date", ascending=False).reset_index(drop=True)
+        if not rows:
+            finish_ingestion_run(conn, run_id, "success")
+            logger.warning("В этом запуске статьи не получены")
+            return
 
-    df.to_csv(OUTPUT_CSV, index=False, encoding="utf-8-sig")
-    import sqlite3
-    conn = sqlite3.connect('news.db')
-    cursor = conn.cursor()
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS articles (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            source TEXT NOT NULL,
-            title TEXT NOT NULL,
-            link TEXT UNIQUE,
-            published_date TIMESTAMP,
-            category TEXT
+        df = pd.DataFrame(rows)
+        df["date"] = pd.to_datetime(df["date"], errors="coerce")
+        df = df.drop_duplicates(subset="link")
+        df = df[df["link"].fillna("").str.strip().ne("")]
+        df = df.sort_values("date", ascending=False).reset_index(drop=True)
+
+        observed_at = timestamp_now()
+        articles_seen, new_articles, existing_articles = save_observations(
+            conn, run_id, df.to_dict("records"), observed_at
         )
-    ''')
-    inserted = 0
-    for _, row in df.iterrows():
-        # Явно преобразуем дату в строку, чтобы избежать конфликтов
-        pub_date = row['date']
-        if pd.notna(pub_date):
-            pub_date = pub_date.strftime('%Y-%m-%d %H:%M:%S')
-        else:
-            pub_date = None
-            
-        cursor.execute('''
-            INSERT OR IGNORE INTO articles (source, title, link, published_date, category)
-            VALUES (?, ?, ?, ?, ?)
-        ''', (row['source'], row['title'], row['link'], pub_date, 'Без категории'))
-        inserted += 1
-    conn.commit()
-    conn.close()
-    print(f"В базу данных добавлено записей: {inserted}")
-    # --------------------------------
-    print(f"\nCSV сохранён: {OUTPUT_CSV}")
-
-    print_summary(df)
-    build_plots(df)
-    print("\nГотово")
+        df.to_csv(OUTPUT_CSV, index=False, encoding="utf-8-sig")
+        logger.info("CSV сохранён: %s", OUTPUT_CSV)
+        logger.info(
+            "Запуск %s: обработано %s, новых %s, уже известных %s",
+            run_id, articles_seen, new_articles, existing_articles,
+        )
+        print_summary(df)
+        build_plots(df)
+        finish_ingestion_run(
+            conn,
+            run_id,
+            "success",
+            articles_seen,
+            new_articles,
+            existing_articles,
+        )
+        logger.info("Сбор завершён")
+    except Exception as error:
+        if run_id is not None:
+            finish_ingestion_run(
+                conn,
+                run_id,
+                "failed",
+                articles_seen,
+                new_articles,
+                existing_articles,
+                str(error)[:2000],
+            )
+        logger.exception("Ошибка запуска парсера")
+        raise
+    finally:
+        conn.close()
 
 
 if __name__ == "__main__":
