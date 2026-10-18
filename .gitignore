@@ -1,0 +1,20 @@
+.env
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+
+# Local database and generated datasets/reports
+*.db
+*.sqlite
+*.sqlite3
+data/raw/*
+data/processed/*
+data/exports/*
+reports/*
+
+# Keep placeholder files in data/report directories, if added later
+!data/raw/.gitkeep
+!data/processed/.gitkeep
+!data/exports/.gitkeep
+!reports/.gitkeep
