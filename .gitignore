@@ -4,6 +4,7 @@ venv/
 __pycache__/
 *.py[cod]
 logs/*.log
+categorize_news.lock
 
 # Local database and generated datasets/reports
 *.db
